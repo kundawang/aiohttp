@@ -1,0 +1,5 @@
+Aligned :class:`~aiohttp.resolver.AsyncResolver` with
+:class:`~aiohttp.resolver.ThreadedResolver`: ``localhost`` and IPv6
+addresses with zone identifiers (e.g. ``fe80::1%eth0``) are now resolved
+through the system resolver, and DNS lookup failures now raise
+:exc:`socket.gaierror` -- by :user:`kundawang`.

@@ -540,6 +540,13 @@ In order to specify the nameservers to when resolving the hostnames,
     resolver = AsyncResolver(nameservers=["8.8.8.8", "8.8.4.4"])
     conn = aiohttp.TCPConnector(resolver=resolver)
 
+.. note::
+
+   :class:`~aiohttp.resolver.AsyncResolver` resolves ``localhost`` and
+   IPv6 addresses with a zone identifier (e.g. ``fe80::1%eth0``) through
+   the system resolver, so these names behave exactly like with the
+   default :class:`~aiohttp.resolver.ThreadedResolver`.
+
 
 Unix domain sockets
 ^^^^^^^^^^^^^^^^^^^
