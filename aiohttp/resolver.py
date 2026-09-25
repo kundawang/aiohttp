@@ -30,6 +30,76 @@ def _is_windows_localhost(host: str) -> bool:
     return _IS_WINDOWS and host.rstrip(".").casefold() == "localhost"
 
 
+def _is_localhost(host: str) -> bool:
+    return host.rstrip(".").casefold() == "localhost"
+
+
+async def _resolve_with_getaddrinfo(
+    loop: asyncio.AbstractEventLoop,
+    host: str,
+    port: int,
+    family: socket.AddressFamily,
+) -> list[ResolveResult]:
+    """Resolve *host* through the system ``getaddrinfo()``.
+
+    This is the resolution path used by ThreadedResolver. AsyncResolver
+    delegates to it for addresses that c-ares cannot parse, such as IPv6
+    zone identifiers (e.g. "fe80::1%eth0"), so both resolvers produce
+    the same results.
+    """
+    try:
+        infos = await loop.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            family=family,
+            flags=_AI_ADDRCONFIG,
+        )
+    except socket.gaierror:
+        if not _is_windows_localhost(host):
+            raise
+        infos = await loop.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            family=family,
+            flags=0,
+        )
+
+    hosts: list[ResolveResult] = []
+    for addr_family, _, proto, _, address in infos:
+        if addr_family == socket.AF_INET6:
+            if len(address) < 3:
+                # IPv6 is not supported by Python build,
+                # or IPv6 is not enabled in the host
+                continue
+            if address[3]:
+                # This is essential for link-local IPv6 addresses.
+                # LL IPv6 is a VERY rare case. Strictly speaking, we should use
+                # getnameinfo() unconditionally, but performance makes sense.
+                resolved_host, _port = await loop.getnameinfo(
+                    address, _NAME_SOCKET_FLAGS
+                )
+                port = int(_port)
+            else:
+                resolved_host, port = address[:2]
+        else:  # IPv4
+            assert addr_family == socket.AF_INET
+            resolved_host, port = address  # type: ignore[misc]
+        hosts.append(
+            ResolveResult(
+                hostname=host,
+                host=resolved_host,
+                port=port,
+                family=addr_family,
+                proto=proto,
+                flags=_NUMERIC_SOCKET_FLAGS,
+            )
+        )
+
+    return hosts
+
+
 class ThreadedResolver(AbstractResolver):
     """Threaded resolver.
 
@@ -43,57 +113,7 @@ class ThreadedResolver(AbstractResolver):
     async def resolve(
         self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
     ) -> list[ResolveResult]:
-        try:
-            infos = await self._loop.getaddrinfo(
-                host,
-                port,
-                type=socket.SOCK_STREAM,
-                family=family,
-                flags=_AI_ADDRCONFIG,
-            )
-        except socket.gaierror:
-            if not _is_windows_localhost(host):
-                raise
-            infos = await self._loop.getaddrinfo(
-                host,
-                port,
-                type=socket.SOCK_STREAM,
-                family=family,
-                flags=0,
-            )
-
-        hosts: list[ResolveResult] = []
-        for family, _, proto, _, address in infos:
-            if family == socket.AF_INET6:
-                if len(address) < 3:
-                    # IPv6 is not supported by Python build,
-                    # or IPv6 is not enabled in the host
-                    continue
-                if address[3]:
-                    # This is essential for link-local IPv6 addresses.
-                    # LL IPv6 is a VERY rare case. Strictly speaking, we should use
-                    # getnameinfo() unconditionally, but performance makes sense.
-                    resolved_host, _port = await self._loop.getnameinfo(
-                        address, _NAME_SOCKET_FLAGS
-                    )
-                    port = int(_port)
-                else:
-                    resolved_host, port = address[:2]
-            else:  # IPv4
-                assert family == socket.AF_INET
-                resolved_host, port = address  # type: ignore[misc]
-            hosts.append(
-                ResolveResult(
-                    hostname=host,
-                    host=resolved_host,
-                    port=port,
-                    family=family,
-                    proto=proto,
-                    flags=_NUMERIC_SOCKET_FLAGS,
-                )
-            )
-
-        return hosts
+        return await _resolve_with_getaddrinfo(self._loop, host, port, family)
 
     async def close(self) -> None:
         pass
@@ -121,6 +141,19 @@ class AsyncResolver(AbstractResolver):
     async def resolve(
         self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
     ) -> list[ResolveResult]:
+        if "%" in host:
+            # c-ares does not support IPv6 zone identifiers (RFC 4007),
+            # e.g. "fe80::1%eth0". Resolve scoped addresses through the
+            # system getaddrinfo() to match ThreadedResolver semantics.
+            return await _resolve_with_getaddrinfo(self._loop, host, port, family)
+        if not _IS_WINDOWS and _is_localhost(host):
+            # c-ares synthesizes "localhost" answers (both 127.0.0.1 and
+            # ::1) instead of honoring /etc/hosts and AI_ADDRCONFIG like
+            # the system resolver does. Resolve localhost through the
+            # system getaddrinfo() to match ThreadedResolver semantics.
+            # On Windows the aiodns path is kept, including its retry
+            # without AI_ADDRCONFIG for offline environments.
+            return await _resolve_with_getaddrinfo(self._loop, host, port, family)
         try:
             try:
                 resp = await self._resolver.getaddrinfo(
@@ -142,7 +175,7 @@ class AsyncResolver(AbstractResolver):
                 )
         except aiodns.error.DNSError as exc:
             msg = exc.args[1] if len(exc.args) >= 1 else "DNS lookup failed"
-            raise OSError(None, msg) from exc
+            raise socket.gaierror(None, msg) from exc
         hosts: list[ResolveResult] = []
         for node in resp.nodes:
             address: tuple[bytes, int] | tuple[bytes, int, int, int] = node.addr
@@ -175,7 +208,7 @@ class AsyncResolver(AbstractResolver):
             )
 
         if not hosts:
-            raise OSError(None, "DNS lookup failed")
+            raise socket.gaierror(None, "DNS lookup failed")
 
         return hosts
 

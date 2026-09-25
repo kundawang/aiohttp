@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, call, create_autospec, patch
 import pytest
 
 from aiohttp.resolver import (
+    _IS_WINDOWS,
     _NAME_SOCKET_FLAGS,
     AsyncResolver,
     DefaultResolver,
@@ -279,6 +280,114 @@ async def test_async_resolver_no_hosts_in_getaddrinfo() -> None:
         with pytest.raises(OSError):
             await resolver.resolve("doesnotexist.bla")
         await resolver.close()
+
+
+@pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@pytest.mark.usefixtures("check_no_lingering_resolvers")
+async def test_async_resolver_multiple_replies_matches_threaded() -> None:
+    """AsyncResolver returns every record, in order, like ThreadedResolver."""
+    ips = ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"]
+    loop = Mock()
+    loop.getaddrinfo = fake_addrinfo(ips)
+    threaded = ThreadedResolver()
+    threaded._loop = loop
+    expected = await threaded.resolve("www.google.com")
+
+    with patch("aiodns.DNSResolver") as mock:
+        mock().getaddrinfo.return_value = fake_aiodns_getaddrinfo_ipv4_result(ips)
+        resolver = AsyncResolver()
+        try:
+            actual = await resolver.resolve("www.google.com")
+        finally:
+            await resolver.close()
+
+    assert [a["host"] for a in actual] == [e["host"] for e in expected] == ips
+
+
+@pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@pytest.mark.usefixtures("check_no_lingering_resolvers")
+async def test_async_resolver_multiple_replies_ipv6() -> None:
+    """AsyncResolver returns every AAAA record, not just the first one."""
+    ips = ["2001:db8::1", "2001:db8::2", "2001:db8::3"]
+    with patch("aiodns.DNSResolver") as mock:
+        mock().getaddrinfo.return_value = fake_aiodns_getaddrinfo_ipv6_result(ips)
+        resolver = AsyncResolver()
+        try:
+            actual = await resolver.resolve("www.google.com", family=socket.AF_INET6)
+        finally:
+            await resolver.close()
+
+    assert [a["host"] for a in actual] == ips
+
+
+@pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@pytest.mark.usefixtures("check_no_lingering_resolvers")
+async def test_async_resolver_negative_lookup_raises_gaierror() -> None:
+    """AsyncResolver raises socket.gaierror like ThreadedResolver."""
+    with patch("aiodns.DNSResolver") as mock:
+        mock().getaddrinfo.side_effect = aiodns.error.DNSError(
+            4, "Domain name not found"
+        )
+        resolver = AsyncResolver()
+        with pytest.raises(socket.gaierror, match="Domain name not found"):
+            await resolver.resolve("doesnotexist.bla")
+        await resolver.close()
+
+
+@pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@pytest.mark.usefixtures("check_no_lingering_resolvers")
+async def test_async_resolver_link_local_ipv6_scope_id_matches_threaded() -> None:
+    """Scoped link-local IPv6 addresses resolve like ThreadedResolver."""
+    loop = Mock()
+    loop.getaddrinfo = fake_ipv6_addrinfo(["fe80::1"])
+    loop.getnameinfo = fake_ipv6_nameinfo("fe80::1%eth0")
+
+    threaded = ThreadedResolver()
+    threaded._loop = loop
+    expected = await threaded.resolve("fe80::1%eth0", 80, socket.AF_INET6)
+
+    with patch("aiodns.DNSResolver") as mock:
+        resolver = AsyncResolver()
+        real_loop = resolver._loop
+        resolver._loop = loop
+        try:
+            actual = await resolver.resolve("fe80::1%eth0", 80, socket.AF_INET6)
+        finally:
+            resolver._loop = real_loop
+            await resolver.close()
+
+    # c-ares cannot parse zone identifiers, so aiodns must be bypassed.
+    mock().getaddrinfo.assert_not_called()
+    assert actual == expected
+    assert actual[0]["host"] == "fe80::1%eth0"
+    assert actual[0]["family"] == socket.AF_INET6
+
+
+@pytest.mark.skipif(not getaddrinfo, reason="aiodns >=3.2.0 required")
+@pytest.mark.skipif(_IS_WINDOWS, reason="Windows keeps the aiodns localhost retry")
+@pytest.mark.usefixtures("check_no_lingering_resolvers")
+async def test_async_resolver_localhost_matches_threaded() -> None:
+    """localhost resolves through the system resolver, like ThreadedResolver."""
+    loop = Mock()
+    loop.getaddrinfo = fake_addrinfo(["127.0.0.1"])
+
+    threaded = ThreadedResolver()
+    threaded._loop = loop
+    expected = await threaded.resolve("localhost", 80, socket.AF_UNSPEC)
+
+    with patch("aiodns.DNSResolver") as mock:
+        resolver = AsyncResolver()
+        real_loop = resolver._loop
+        resolver._loop = loop
+        try:
+            actual = await resolver.resolve("localhost", 80, socket.AF_UNSPEC)
+        finally:
+            resolver._loop = real_loop
+            await resolver.close()
+
+    # c-ares synthesizes localhost answers, so aiodns must be bypassed.
+    mock().getaddrinfo.assert_not_called()
+    assert actual == expected
 
 
 async def test_threaded_resolver_positive_lookup() -> None:
